@@ -17,6 +17,7 @@
 #include "lobster/vmops.h"
 
 #include "lobster/lobsterreader.h"
+#include "lobster/tasks.h"
 
 namespace lobster {
 
@@ -85,6 +86,7 @@ VM::VM(VMArgs &&vmargs)
 
 VM::~VM() {
     TerminateWorkers();
+    DeleteScheduler(sched);
 
     #if LOBSTER_FRAME_PROFILER == 2
         // FIXME: this is not ideal, because there may be multiple VMs.
@@ -776,6 +778,8 @@ static void PrepareLongJmpBuffer(jmp_buf buf) {
 #endif
 
 [[noreturn]] void VM::UnwindOnError() {
+    // An error in a task has to be raised where the program was started, see TaskForwardError.
+    TaskForwardError(*this);
     // This is the single location from which we unwind the execution stack from within the VM.
     // This requires special care, because there may be jitted code on the stack, and depending
     // on the platform we can use exception handling, or not.

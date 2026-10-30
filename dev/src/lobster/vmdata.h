@@ -106,6 +106,7 @@ enum type_elem_t : int {  // Strongly typed element of typetable.
 };
 
 struct VM;
+struct Scheduler;
 
 // The family index of a struct in an abstract struct family (see TypeInfo::IsFamilyStruct) is
 // the low 8 bits of its first slot, which is all of it unless fields share the slot (see
@@ -1194,6 +1195,8 @@ struct VM : VMBase {
     bool workers_started = false;
     vector<std::thread> workers;
     TupleSpace *tuple_space = nullptr;
+    // The cooperative threads of this VM, created by the first task.spawn, see tasks.h.
+    Scheduler *sched = nullptr;
 
     // These are used by builtins, sticking them here makes them thread-safe.
     RandomNumberGenerator<MersenneTwister> rndm;

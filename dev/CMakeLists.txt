@@ -70,6 +70,7 @@ else()
     src/lobster/simplex.h
     src/lobster/slaballoc.h
     src/lobster/stdafx.h
+    src/lobster/tasks.h
     src/lobster/tonative.h
     src/lobster/tools.h
     src/lobster/dllist.h
@@ -101,6 +102,7 @@ else()
     src/compiler.cpp
     src/file.cpp
     src/tcp.cpp
+    src/tasks.cpp
     src/lobsterreader.cpp
     src/main.cpp
     src/pakfile.cpp

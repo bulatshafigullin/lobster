@@ -3,6 +3,7 @@
 
 #include "lobster/stdafx.h"
 #include "lobster/natreg.h"
+#include "lobster/tasks.h"
 
 #ifdef _WIN32
     #include <winsock2.h>
@@ -37,16 +38,51 @@
     struct SocketSystem { int error = 0; };
 #endif
 
+// What a poller sits on: the kernel's event queue where there is one, else select (which also has
+// to do on Windows). LOBSTER_TCP_POLLER_SELECT forces the latter, to test it.
+#if defined(__linux__) && !defined(LOBSTER_TCP_POLLER_SELECT)
+    #define TCP_POLLER_EPOLL 1
+    #define TCP_POLLER_KQUEUE 0
+    #include <sys/epoll.h>
+#elif (defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)) && \
+      !defined(LOBSTER_TCP_POLLER_SELECT)
+    #define TCP_POLLER_EPOLL 0
+    #define TCP_POLLER_KQUEUE 1
+    #include <sys/event.h>
+#else
+    #define TCP_POLLER_EPOLL 0
+    #define TCP_POLLER_KQUEUE 0
+#endif
+
 namespace lobster {
 
 static ResourceType tcplistener_type = { "tcplistener" };
 static ResourceType tcpsocket_type = { "tcpsocket" };
+static ResourceType tcppoller_type = { "tcppoller" };
 
 struct TCPSocket : Resource {
     SocketHandle handle = invalid_socket;
     bool connecting = false;
     int connect_error = 0;
     ~TCPSocket() override { if (handle != invalid_socket) CloseSocket(handle); }
+};
+
+// A set of sockets to wait on all at once, each with a tag of the program's choosing to tell it
+// which is ready. Readiness is reported when it changes (edge-triggered on the kernel queues): a
+// socket that was read until receive had nothing more, or written until send did, is reported
+// again only when something new happens to it.
+struct TCPPoller : Resource {
+    #if TCP_POLLER_EPOLL || TCP_POLLER_KQUEUE
+        int queue = -1;
+        ~TCPPoller() override { if (queue >= 0) close(queue); }
+    #else
+        struct Entry {
+            SocketHandle handle;
+            iint tag;
+            bool writable;
+        };
+        vector<Entry> entries;
+    #endif
 };
 
 static LString *TCPError(VM &vm, const char *operation, int error) {
@@ -94,7 +130,7 @@ static LString *OpenSocket(VM &vm, LResource **out, LString *ip, iint port, bool
         #endif
         if (setsockopt(socket->handle, SOL_SOCKET, reuse_option, (const char *)&on, sizeof(on)))
             return TCPError(vm, "listen", SocketError());
-        if (::bind(socket->handle, (sockaddr *)&addr, sizeof(addr)) || ::listen(socket->handle, 8))
+        if (::bind(socket->handle, (sockaddr *)&addr, sizeof(addr)) || ::listen(socket->handle, SOMAXCONN))
             return TCPError(vm, "listen", SocketError());
     } else if (::connect(socket->handle, (sockaddr *)&addr, sizeof(addr))) {
         auto err = SocketError();
@@ -241,6 +277,161 @@ BUILTIN(receive, "socket,max_bytes", "R:tcpsocketI", "S?S?",
     return (LString *)nullptr;
 }
 
+BUILTIN(poller, "", "", "R:tcppoller?S?",
+    "create a poller, to wait for many sockets at once (see watch and poll). Returns poller, error.")
+(VM &vm, LResource **out) {
+    *out = nullptr;
+    static SocketSystem system;
+    if (system.error) return TCPError(vm, "init", system.error);
+    auto poller = make_unique<TCPPoller>();
+    #if TCP_POLLER_EPOLL
+        poller->queue = epoll_create1(EPOLL_CLOEXEC);
+        if (poller->queue < 0) return TCPError(vm, "poller", SocketError());
+    #elif TCP_POLLER_KQUEUE
+        poller->queue = kqueue();
+        if (poller->queue < 0 || fcntl(poller->queue, F_SETFD, FD_CLOEXEC) < 0)
+            return TCPError(vm, "poller", SocketError());
+    #endif
+    *out = vm.NewResource(&tcppoller_type, poller.release());
+    return nullptr;
+}
+
+static LString *Watch(VM &vm, TCPPoller &p, TCPSocket &s, iint tag, bool writable) {
+    if (s.handle == invalid_socket) return vm.NewString("tcp.watch: socket is closed");
+    #if TCP_POLLER_EPOLL
+        epoll_event ev{};
+        ev.events = EPOLLIN | EPOLLRDHUP | EPOLLET | (writable ? EPOLLOUT : 0);
+        ev.data.u64 = (uint64_t)tag;
+        if (epoll_ctl(p.queue, EPOLL_CTL_ADD, s.handle, &ev) &&
+            (errno != EEXIST || epoll_ctl(p.queue, EPOLL_CTL_MOD, s.handle, &ev)))
+            return TCPError(vm, "watch", SocketError());
+    #elif TCP_POLLER_KQUEUE
+        struct kevent changes[2];
+        EV_SET(&changes[0], (uintptr_t)s.handle, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, (void *)(intptr_t)tag);
+        // Always there, so that it can be turned on and off without there being nothing to take back.
+        EV_SET(&changes[1], (uintptr_t)s.handle, EVFILT_WRITE,
+               EV_ADD | EV_CLEAR | (writable ? EV_ENABLE : EV_DISABLE), 0, 0, (void *)(intptr_t)tag);
+        if (kevent(p.queue, changes, 2, nullptr, 0, nullptr)) return TCPError(vm, "watch", SocketError());
+    #else
+        for (auto &e : p.entries) {
+            if (e.handle == s.handle) {
+                e.tag = tag;
+                e.writable = writable;
+                return nullptr;
+            }
+        }
+        p.entries.push_back({ s.handle, tag, writable });
+    #endif
+    return nullptr;
+}
+
+BUILTIN(watch, "poller,socket,tag,writable", "R:tcppollerR:tcpsocketIB", "S?",
+    "have poll report the tag when the socket has data to receive or was closed, or, with writable,"
+    " when it can be sent to. Calling it again for the same socket changes its tag and writable."
+    " Only changes are reported: call receive until it has nothing more, send until it can't, and"
+    " set writable only while a send is waiting for room. A closed socket is no longer watched.")
+(VM &vm, LResource *poller, LResource *socket, iint tag, iint writable) {
+    auto &s = GetResourceDec<TCPSocket>(socket, &tcpsocket_type);
+    return Watch(vm, GetResourceDec<TCPPoller>(poller, &tcppoller_type), s, tag, writable || s.connecting);
+}
+
+BUILTIN(watch_listener, "poller,listener,tag", "R:tcppollerR:tcplistenerI", "S?",
+    "have poll report the tag when the listener has a connection to accept. Call accept until it"
+    " has nothing more.")
+(VM &vm, LResource *poller, LResource *listener, iint tag) {
+    return Watch(vm, GetResourceDec<TCPPoller>(poller, &tcppoller_type),
+                 GetResourceDec<TCPSocket>(listener, &tcplistener_type), tag, false);
+}
+
+BUILTIN_OUTS(poll, "poller,seconds", "R:tcppollerF", "I]",
+    "waits for at most seconds (0..60) for any watched socket to change, and returns the tags of those"
+    " that did (nothing if none, or the time was up). With tasks, only the caller waits, as with wait.")
+(VM &vm, LVector **ready, LResource *poller, double seconds) {
+    *ready = vm.NewVec(0, 0, TYPE_ELEM_VECTOR_OF_INT);
+    if (!(seconds >= 0.0 && seconds <= 60.0)) vm.BuiltinError("tcp.poll: seconds must be 0..60");
+    auto &p = GetResourceDec<TCPPoller>(poller, &tcppoller_type);
+    #if TCP_POLLER_EPOLL || TCP_POLLER_KQUEUE
+        // The queue is itself something that can be waited for, readable while it holds events.
+        if (seconds > 0) {
+            bool woken;
+            if (TaskWaitIO(vm, p.queue, -1, -1, seconds, woken)) {
+                if (!woken) return;
+                seconds = 0;  // Just take what is there.
+            }
+        }
+        #if TCP_POLLER_EPOLL
+            epoll_event events[256];
+            int n = epoll_wait(p.queue, events, 256, (int)ceil(seconds * 1000.0));
+            for (int i = 0; i < max(n, 0); i++) (*ready)->Push(vm, (iint)events[i].data.u64);
+        #else
+            struct kevent events[256];
+            timespec ts;
+            ts.tv_sec = (time_t)seconds;
+            ts.tv_nsec = (long)((seconds - (double)ts.tv_sec) * 1e9);
+            int n = kevent(p.queue, nullptr, 0, events, 256, &ts);
+            for (int i = 0; i < max(n, 0); i++) (*ready)->Push(vm, (iint)(intptr_t)events[i].udata);
+        #endif
+    #else
+        // Nothing here can be parked on for readiness, so with tasks just let them run a moment.
+        if (seconds > 0) {
+            bool woken;
+            if (TaskWaitIO(vm, -1, -1, -1, min(seconds, 0.001), woken)) seconds = 0;
+        }
+        // Closed sockets are not taken out by anyone, and make select fail, so they are found then.
+        for (int attempt = 0; attempt < 2; attempt++) {
+            fd_set reading, writing;
+            FD_ZERO(&reading);
+            FD_ZERO(&writing);
+            int highest = -1;
+            for (auto &e : p.entries) {
+                #ifndef _WIN32
+                    if (e.handle >= FD_SETSIZE) continue;
+                #endif
+                FD_SET(e.handle, &reading);
+                if (e.writable) FD_SET(e.handle, &writing);
+                highest = max(highest, (int)e.handle);
+            }
+            if (highest < 0) {
+                std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+                return;
+            }
+            timeval timeout;
+            timeout.tv_sec = (long)seconds;
+            timeout.tv_usec = (long)((seconds - (double)timeout.tv_sec) * 1000000.0);
+            // Level-triggered, so a socket that isn't read from is reported again at once.
+            auto n = select(highest + 1, &reading, &writing, nullptr, &timeout);
+            if (n < 0 && attempt == 0) {
+                std::erase_if(p.entries, [](const TCPPoller::Entry &e) {
+                    int type;
+                    SocketLength len = sizeof(type);
+                    return getsockopt(e.handle, SOL_SOCKET, SO_TYPE, (char *)&type, &len) != 0;
+                });
+                continue;
+            }
+            if (n > 0)
+                for (auto &e : p.entries)
+                    if (FD_ISSET(e.handle, &reading) || FD_ISSET(e.handle, &writing)) (*ready)->Push(vm, e.tag);
+            break;
+        }
+    #endif
+}
+
+BUILTIN(close, "socket", "R:tcpsocket", "",
+    "closes the socket now, rather than when the last reference to it is dropped, which a program"
+    " can't always tell. Later calls on it report an error, and the peer sees the end of the connection.")
+(VM &, LResource *socket) {
+    auto &s = GetResourceDec<TCPSocket>(socket, &tcpsocket_type);
+    if (s.handle != invalid_socket) {
+        CloseSocket(s.handle);
+        s.handle = invalid_socket;
+    }
+    #ifdef _WIN32
+        s.connect_error = WSAENOTSOCK;
+    #else
+        s.connect_error = EBADF;
+    #endif
+}
+
 BUILTIN(wait, "listener,socket,writable,seconds", "R:tcplistener?R:tcpsocket?BF", "B",
     "the one call here that blocks, for a loop with nothing to do until its peer acts: sleeps for at"
     " most seconds (0..1), or until the listener has a connection to accept, or the socket has data"
@@ -248,11 +439,27 @@ BUILTIN(wait, "listener,socket,writable,seconds", "R:tcplistener?R:tcpsocket?BF"
     " to try those calls now, rather than whether they will succeed.")
 (VM &vm, LResource *listener, LResource *socket, iint writable, double seconds) {
     if (!(seconds >= 0.0 && seconds <= 1.0)) vm.BuiltinError("tcp.wait: seconds must be 0..1");
+    #ifndef _WIN32
+    {
+        // With tasks, this parks the caller instead of holding up all of them.
+        int listener_fd = -1, socket_fd = -1, writing_fd = -1;
+        if (listener) listener_fd = GetResourceDec<TCPSocket>(listener, &tcplistener_type).handle;
+        if (socket) {
+            auto &s = GetResourceDec<TCPSocket>(socket, &tcpsocket_type);
+            socket_fd = s.handle;
+            if (writable || s.connecting) writing_fd = s.handle;
+        }
+        if (socket && socket_fd < 0) return true;  // Closed: the call tried next reports it.
+        bool ready;
+        if (TaskWaitIO(vm, listener_fd, socket_fd, writing_fd, seconds, ready)) return ready;
+    }
+    #endif
     fd_set reading, writing;
     FD_ZERO(&reading);
     FD_ZERO(&writing);
     int highest = -1;
     auto watch = [&](SocketHandle handle, fd_set &set) {
+        if (handle == invalid_socket) return false;  // Closed: the call tried next reports it.
         #ifndef _WIN32
             if (handle >= FD_SETSIZE) return false;
         #endif
