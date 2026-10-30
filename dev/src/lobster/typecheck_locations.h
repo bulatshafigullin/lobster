@@ -382,6 +382,46 @@ struct TypeCheckLocations : virtual TypeCheckBase {
         CheckLvalBorrowed(call, b);
     }
 
+    // Whether a task other than the running one could write to this location: a global, or a
+    // field or element of an object (which every task that has the object can write). What is
+    // left is a variable of the function itself, which other tasks only have copies of.
+    bool Shareable(const LValContext &lv) {
+        auto p = lv;
+        p.Canonicalize();
+        return p.sid && (!p.derefs.empty() || p.sid->sf_def == st.toplevel);
+    }
+
+    // A call that parks the current task lets the others run, which may write any location they
+    // can reach (see Shareable), so it counts as a write to every one of them: borrows of them
+    // are given a reference of their own where that is possible and are an error where not, and
+    // flow typing of them is undone. It is recorded like any write, such that the functions
+    // this is in do the same when they are called again.
+    void CheckPark(Node *n) {
+        for (auto &sc : scopes) sc.sf->reuse_assign_events.push_back({ n, LValContext(nullptr), {} });
+        ApplyPark(n);
+    }
+
+    bool checking_park = false;
+
+    void ApplyPark(Node *n) {
+        auto outer = checking_park;
+        checking_park = true;
+        // Not a range for: checking can add to the stacks.
+        for (size_t i = 0; i < borrowstack.size(); i++) {
+            if (!borrowstack[i].refc || !Shareable(borrowstack[i])) continue;
+            Borrow b = borrowstack[i];
+            b.Canonicalize();
+            CheckLvalBorrowed(n, b);
+        }
+        for (size_t i = 0; i < flowstack.size(); i++) {
+            if (!Shareable(flowstack[i]) || flowstack[i].now->Equal(*flowstack[i].old)) continue;
+            LValContext path = flowstack[i];
+            FlowItem fi(path, flowstack[i].old);
+            AssignFlowDemote(fi, flowstack[i].old, CF_NONE, *n);
+        }
+        checking_park = outer;
+    }
+
     // If any of the functions this write sits in is reused, we need to be able to replay
     // checking the errors in CheckLvalBorrowed, since the contents of the borrowstack may be
     // different.
@@ -436,6 +476,10 @@ struct TypeCheckLocations : virtual TypeCheckBase {
         auto outer = replaying;
         replaying = sf;
         for (auto &ev : sf->reuse_assign_events) {
+            if (!ev.lv.sid) {
+                ApplyPark(ev.n);
+                continue;
+            }
             Borrow lv(ev.lv);
             CheckLvalBorrowed(ev.n, lv);
             // The write also stands for any promotion this context has of what it overwrites.
@@ -664,6 +708,12 @@ struct TypeCheckLocations : virtual TypeCheckBase {
             LValContext clv = lv;
             clv.Canonicalize();
             auto same = cb.sid == clv.sid && cb.DerefsEqual(clv);
+            if (checking_park) {
+                Error(*n, "this call may park the task, and another task may then modify ",
+                          Q(lv.Name()), ", which is borrowed", same ? string("") : cat(" by ", Q(b.Name())),
+                          " at ", parser.lex.Location(b.line), ": copy what is needed before it");
+                continue;
+            }
             Error(*n, "cannot modify ", Q(lv.Name()), " while ",
                       same ? string("it is borrowed") : cat(Q(b.Name()), " borrows it"),
                       " at ", parser.lex.Location(b.line));
@@ -700,6 +750,10 @@ struct TypeCheckLocations : virtual TypeCheckBase {
         auto held = ExpandAliases(path);
         auto &evs = sc.sf->reuse_assign_events;
         for (size_t i = sc.loop_events_start; i < evs.size(); i++) {
+            if (!evs[i].lv.sid) {
+                if (Shareable(path)) return true;  // A park.
+                continue;
+            }
             if (WriteHits(held, ExpandAliases(evs[i].lv))) return true;
         }
         return false;

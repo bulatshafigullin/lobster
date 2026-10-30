@@ -557,6 +557,9 @@ void RegisterCoreLanguageBuiltins(NativeRegistry &nfr) {
     RegisterBuiltin(nfr, "", "parsedata", parsedata_builtins);
     RegisterBuiltin(nfr, "matrix", "matrix", matrix_builtins);
     RegisterBuiltin(nfr, "", "noise", noise_builtins);
+    // These can park the current task, see NativeFun::parks.
+    for (auto name : { "task.yield", "task.sleep", "task.join", "task.wait_all", "tcp.wait", "tcp.poll" })
+        if (auto nf = nfr.FindNative(name)) nf->parks = true;
 }
 
 #if !LOBSTER_ENGINE

@@ -6,6 +6,14 @@
 // task.join, tcp.wait) parks it and runs another one instead, so code reads as if it blocks.
 // There is no function coloring: any function may park, however deep in the call chain.
 //
+// The compiler's borrow check knows that these calls park (NativeFun::parks), and treats them as
+// writes to everything another task can reach: a global, or a field or element of an object.
+// A variable initialized from such a location then keeps a reference of its own, flow typing of
+// it (a nil check) is undone, and where neither can be done, as when iterating over a global
+// vector, parking inside the loop is an error that says so. A variable of the function itself
+// is not affected, since a task only has copies of those. Calls thru a declared function type
+// are not known to park, as they are not known to write either.
+//
 // All tasks of a VM share its thread, and never run in parallel, so they need no locking.
 // The scheduler is owned by the VM, and each worker thread's VM has its own.
 

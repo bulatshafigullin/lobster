@@ -274,6 +274,25 @@ def test_read_and_write_waits():
     assert rw_got == "hello"
     assert seconds_elapsed() - t0 < 0.9
 
+// What a task took out of a global before parking is still there after, even if another task
+// replaced the global meanwhile (the compiler keeps a reference instead of borrowing it).
+var shared_list = [1, 2, 3]
+var shared_junk: [[int]] = []
+var kept_list: [int] = []
+
+def holds_global():
+    let x = shared_list
+    task.yield()
+    kept_list = x
+
+def test_park_keeps_borrowed_globals():
+    task.spawn(): holds_global()
+    task.spawn():
+        shared_list = [7, 8, 9, 10]
+        for(20): shared_junk.push([5, 5, 5])
+    task.wait_all()
+    assert equal(kept_list, [1, 2, 3])
+
 test_interleave()
 test_wait_all()
 test_sleep_overlaps()
@@ -288,5 +307,6 @@ test_many_tasks()
 test_nested()
 test_tcp()
 test_read_and_write_waits()
+test_park_keeps_borrowed_globals()
 
 print "tasks test passed"

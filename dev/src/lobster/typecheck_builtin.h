@@ -274,6 +274,7 @@ struct TypeCheckBuiltin : virtual TypeCheckLocations {
             DecBorrowers(c->lt, node);
             if (arg.flags & NF_MUTATES) CheckElementWrite(c, &node);
         }
+        if (node.nf->parks) CheckPark(&node);
 
         VoidNode(node);  // no retvals
         if (node.nf->retvals.size() > 1) node.exptype = st.NewTuple(node.nf->retvals.size());

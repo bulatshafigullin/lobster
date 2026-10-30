@@ -350,6 +350,14 @@ BUILTIN_OUTS(poll, "poller,seconds", "R:tcppollerF", "I]",
     *ready = vm.NewVec(0, 0, TYPE_ELEM_VECTOR_OF_INT);
     if (!(seconds >= 0.0 && seconds <= 60.0)) vm.BuiltinError("tcp.poll: seconds must be 0..60");
     auto &p = GetResourceDec<TCPPoller>(poller, &tcppoller_type);
+    // The argument is only borrowed, and another task may drop the last other reference to the
+    // poller while this one is parked.
+    struct Hold {
+        VM &vm;
+        LResource *res;
+        Hold(VM &_vm, LResource *r) : vm(_vm), res(r) { res->Inc(); }
+        ~Hold() { res->Dec(vm); }
+    } hold(vm, poller);
     #if TCP_POLLER_EPOLL || TCP_POLLER_KQUEUE
         // The queue is itself something that can be waited for, readable while it holds events.
         if (seconds > 0) {

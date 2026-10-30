@@ -536,6 +536,10 @@ struct NativeFun : Named {
 
     int subsystemid = -1;
 
+    // The call can park the current task, which lets other tasks run and write anything they
+    // can reach, see TypeChecker::CheckPark. Set by whoever registers the builtin.
+    bool parks = false;
+
     NativeFun *overloads = nullptr, *first = this;
 
     NativeFun(const char *ns, const BuiltinDef &def)
