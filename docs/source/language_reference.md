@@ -1592,3 +1592,63 @@ load balancing for however many cores are available.
 
 For now, the easiest way to get a feel for how this works is to read
 `samples/threads.lobster`.
+
+
+Tasks
+-----
+
+Tasks are cheap cooperative threads inside a single VM, similar in spirit to Java's
+virtual threads. Each task has a native stack of its own, and a call that would
+block (`task.sleep`, `task.join`, `task.wait_all`, `tcp.wait`) parks it and runs
+another task instead, so code is written as if it blocks. There is no function
+coloring: any function may park, however deep in the call chain, without being
+declared differently.
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+var total = 0
+
+def work(n: int):
+    task.sleep(0.1)         // parks this task only
+    total += n
+
+let handles = map(10) i: task.spawn(): work(i)
+for(handles) h: task.join(h)
+print total
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Things to know:
+
+-   All tasks of a VM run on one OS thread, one at a time, switching only at
+    parking calls (`task.yield` parks just to let others run). They never run in
+    parallel, so they need no locks. Use the multi-threading above for that.
+-   `task.spawn` takes a copy of the local variables the block uses, so a task
+    sees its own values for those. Use globals (or fields of an object) to share
+    state between tasks.
+-   Because another task may change shared state whenever you park, the compiler
+    treats a parking call as a write to every global and every field or element
+    of an object. A variable initialized from such a location keeps its own
+    reference across the park, and a nil check on one is forgotten after it.
+    Iterating over a global vector with a parking call in the loop is a compile
+    error ("this call may park the task..."): copy what you need before the loop.
+    Calls through a declared function type are not known to park.
+-   A runtime error in a task is raised in the program as a whole. A deadlock
+    (all tasks waiting for each other) is reported as an error.
+-   Waiting for I/O uses kqueue on macOS/BSD and epoll on Linux, with a `poll()`
+    fallback. Tasks are not available on Windows and WebAssembly: `task.spawn`
+    is a runtime error there.
+-   Each parked task costs a 1 MiB virtual stack (only touched pages count) and a
+    switch takes tens of nanoseconds, so tens of thousands of tasks are fine.
+
+### HTTP server
+
+`modules/httpserver.lobster` is an HTTP/1.1 server whose internals are a
+hand-written, non-blocking event loop, while handlers can be written in either
+style: `route` handlers run on the loop, must not block, and return `nil` to be
+called again on the next pass (state is kept in the request), while `route_task`
+handlers run in a task of their own and can block freely. See
+`samples/webserver.lobster`. It has no TLS and has not been hardened for use on
+the open internet; put it behind a reverse proxy.
+
+For non-task programs that want to multiplex many sockets, `tcp.poller`,
+`tcp.watch`, `tcp.watch_listener` and `tcp.poll` give edge-triggered readiness
+notifications (kqueue / epoll, `select` where neither exists).
